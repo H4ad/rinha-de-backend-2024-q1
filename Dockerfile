@@ -39,5 +39,9 @@ COPY --from=deps /usr/src/app/node_modules ./node_modules
 COPY --from=builder_deps /usr/src/app/package.json ./package.json
 COPY --from=builder /usr/src/app/dist ./dist
 
+# Because of health check
+RUN apk add --update curl && \
+    rm -rf /var/cache/apk/*
+
 EXPOSE 3000
 CMD [ "node", "dist/index.js" ]
