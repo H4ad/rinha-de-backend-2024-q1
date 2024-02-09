@@ -15,4 +15,6 @@ if seedInstalled == nil or seedInstalled == false then
 
   redis.call('hset', 'users:5', 'limit', 500000)
   redis.call('hset', 'users:5', 'balance', 0)
+
+  redis.call('set', 'seed', 1)
 end
