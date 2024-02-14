@@ -1,19 +1,33 @@
 version: '3'
 
 services:
-  redis:
-    image: redis:alpine
+  db:
+    image: postgres:16.1
+    command: 'postgres -c max_connections=26 -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c checkpoint_timeout=1d -c shared_preload_libraries="pg_stat_statements" -c compute_query_id=on -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all'
+    restart: unless-stopped
     ports:
-      - '6379:6379'
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_USER: rinha
+      POSTGRES_DB: dev
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U rinha -d dev']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     deploy:
       resources:
         limits:
-          cpus: '0.3'
-          memory: '200MB'
+          cpus: '0.7'
+          memory: '300MB'
 
   api1:
     build: .
     hostname: api1
+    restart: unless-stopped
     ports:
       - '3000:3000'
     healthcheck:
@@ -22,18 +36,19 @@ services:
       timeout: 5s
       retries: 5
     environment:
-      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgres://rinha:password@db:5432/dev
     depends_on:
-      - redis
+      - db
     deploy:
       resources:
         limits:
-          cpus: '0.5'
-          memory: '128MB'
+          cpus: '0.3'
+          memory: '85MB'
 
   api2:
     build: .
     hostname: api2
+    restart: unless-stopped
     ports:
       - '3001:3000'
     healthcheck:
@@ -42,17 +57,18 @@ services:
       timeout: 5s
       retries: 5
     environment:
-      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgres://rinha:password@db:5432/dev
     depends_on:
-      - redis
+      - db
     deploy:
       resources:
         limits:
-          cpus: '0.5'
-          memory: '128MB'
+          cpus: '0.3'
+          memory: '85MB'
 
   nginx:
-    image: nginx:1.24-alpine
+    image: nginx:alpine
+    restart: unless-stopped
     volumes:
       - ./default.conf:/etc/nginx/nginx.conf:ro
     depends_on:
@@ -64,4 +80,4 @@ services:
       resources:
         limits:
           cpus: '0.2'
-          memory: '94MB'
+          memory: '80MB'
