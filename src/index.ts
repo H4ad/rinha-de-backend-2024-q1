@@ -18,6 +18,8 @@ type TransactionResult = {
   saldo: number;
 }
 
+type ExcerptTransaction = { valor: number, tipo: 'c' | 'd', descricao: string, realizada_em: Date };
+
 type Excerpt = {
   saldo: {
     total: number;
@@ -25,13 +27,17 @@ type Excerpt = {
     limite: number;
   }
 
-  ultimas_transacoes: { valor: number, tipo: 'c' | 'd', descricao: string, realizada_em: string }[];
+  ultimas_transacoes: ExcerptTransaction[];
+}
+
+type CachedExcerpt = Omit<Excerpt, 'ultimas_transacoes'> & {
+  ultimas_transacoes: Array<Omit<ExcerptTransaction, 'realizada_em'> & { realizada_em: string }>;
 }
 
 const transactionParse = json.createValidateParse<Transaction>();
 const transactionStringify = json.createStringify<TransactionResult>();
 const excerptStringify = json.createStringify<Excerpt>();
-const excerptParse = json.createValidateParse<Excerpt>();
+const cachedExcerptParse = json.createValidateParse<CachedExcerpt>();
 const stringifyTypiaErrors = json.createStringify<{ errors: IValidation.IError[] }>();
 
 const sql = postgres(process.env.DATABASE_URL ?? 'postgres://rinha:password@localhost:5432/dev', {
@@ -133,7 +139,7 @@ const extractHandler = (id: number, req: IncomingMessage, res: ServerResponse) =
     }
 
     if (cachedData) {
-      const oldExcerpt = excerptParse(cachedData);
+      const oldExcerpt = cachedExcerptParse(cachedData);
 
       if (!oldExcerpt.success) {
         console.error('Error parsing cached data', oldExcerpt.errors);
@@ -146,7 +152,10 @@ const extractHandler = (id: number, req: IncomingMessage, res: ServerResponse) =
           data_extrato: new Date().toISOString(),
           limite: oldExcerpt.data.saldo.limite,
         },
-        ultimas_transacoes: oldExcerpt.data.ultimas_transacoes,
+        ultimas_transacoes: oldExcerpt.data.ultimas_transacoes.map((transaction: any) => ({
+          ...transaction,
+          realizada_em: new Date(transaction.realizada_em),
+        })),
       });
 
       res.writeHead(200, {...defaultJsonHeaders, 'content-length': Buffer.byteLength(jsonResult)});
