@@ -1,8 +1,7 @@
-import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import pg from 'pg';
-import { json, tags, type IValidation } from 'typia';
-
-const {Client} = pg;
+import {createServer, IncomingMessage, ServerResponse} from 'node:http';
+import postgres from 'postgres';
+import {type IValidation, json, tags} from 'typia';
+import {Redis} from 'ioredis';
 
 const defaultJsonHeaders = {
   'Content-Type': 'application/json',
@@ -22,31 +21,23 @@ type TransactionResult = {
 type Excerpt = {
   saldo: {
     total: number;
-    data_extrato: Date;
+    data_extrato: string;
     limite: number;
   }
 
-  ultimas_transacoes: { valor: number, tipo: 'c' | 'd', descricao: string, realizada_em: Date }[];
+  ultimas_transacoes: { valor: number, tipo: 'c' | 'd', descricao: string, realizada_em: string }[];
 }
 
 const transactionParse = json.createValidateParse<Transaction>();
 const transactionStringify = json.createStringify<TransactionResult>();
 const excerptStringify = json.createStringify<Excerpt>();
+const excerptParse = json.createValidateParse<Excerpt>();
 const stringifyTypiaErrors = json.createStringify<{ errors: IValidation.IError[] }>();
 
-const client = new Client({
-  connectionString: process.env.DATABASE_URL ?? 'postgres://postgres:hbZkzny5xrvVH@localhost:5432/dev',
-  statement_timeout: 0,
-  query_timeout: 0,
-  connectionTimeoutMillis: 0,
-  keepAlive: true,
+const sql = postgres(process.env.DATABASE_URL ?? 'postgres://rinha:password@localhost:5432/dev', {
+  max: 20,
 });
-
-client.connect();
-
-client.on('error', (error) => {
-  console.error(error);
-});
+const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379/0');
 
 const waitPayload = (req: IncomingMessage, callback: (data: string | null) => void) => {
   let body: null | string = null;
@@ -101,30 +92,31 @@ const transactionHandler = (id: number, req: IncomingMessage, res: ServerRespons
       return;
     }
 
-    const args = [id, parsed.data.tipo, parsed.data.valor, parsed.data.descricao];
-    client.query(`CALL SALVAR_TRANSACAO($1, $2, $3, $4, '0'::varchar);`, args, (error: any, result) => {
-      if (error) {
-        if (error.constraint === 'pessoas_check') {
-          return unprocessableEntityHandler(res);
-        }
-
-        console.error('Error calling procedure', error);
-        return unexpectedError(res);
-      }
-
-      if (result.rowCount === 0) {
+    sql<{ resultado: string }[]>`CALL SALVAR_TRANSACAO(${id}, ${parsed.data.tipo}, ${parsed.data.valor}, ${parsed.data.descricao}, '0'::varchar);`.then((result) => {
+      if (result.length === 0) {
         console.error('Error zero rows updated');
         return unexpectedError(res);
       }
 
-      if (result.rows[0].resultado === '-1') {
+      if (result[0].resultado === '-1') {
         return notFoundHandler(res);
       }
 
-      const [balance, limit] = result.rows[0].resultado.split(':');
+      redis.hdel(`person:${id}`, 'extract');
 
-      res.writeHead(200, defaultJsonHeaders);
-      res.end(transactionStringify({saldo: +balance, limite: +limit}));
+      const [balance, limit] = result[0].resultado.split(':');
+
+      const jsonResult = transactionStringify({saldo: +balance, limite: +limit});
+
+      res.writeHead(200, {...defaultJsonHeaders, 'content-length': Buffer.byteLength(jsonResult) });
+      res.end(jsonResult);
+    }).catch(error => {
+      if (error.constraint_name === 'pessoas_check') {
+        return unprocessableEntityHandler(res);
+      }
+
+      console.error('Error calling procedure', error);
+      return unexpectedError(res);
     });
   });
 };
@@ -134,33 +126,65 @@ const extractHandler = (id: number, req: IncomingMessage, res: ServerResponse) =
     return notFoundHandler(res);
   }
 
-  client.query(`SELECT id, limite, saldo FROM pessoas WHERE id = $1;`, [id], (error, result) => {
+  redis.hget(`person:${id}`, 'extract', (error, cachedData) => {
     if (error) {
-      console.error('Error selecting data', error);
+      console.error('Error getting data from cache', error);
       return unexpectedError(res);
     }
 
-    if (result.rowCount === 0) {
-      return notFoundHandler(res);
-    }
+    if (cachedData) {
+      const oldExcerpt = excerptParse(cachedData);
 
-    const data = result.rows[0];
-
-    client.query(`SELECT valor, tipo, descricao, realizada_em FROM transacoes WHERE pessoa_id = $1 ORDER BY realizada_em DESC LIMIT 10;`, [id], (err2, transactions) => {
-      if (err2) {
-        console.error('Error selecting data of transactions', err2);
+      if (!oldExcerpt.success) {
+        console.error('Error parsing cached data', oldExcerpt.errors);
         return unexpectedError(res);
       }
 
-      res.writeHead(200, defaultJsonHeaders);
-      res.end(excerptStringify({
+      const jsonResult = excerptStringify({
         saldo: {
-          limite: data.limite,
-          total: data.saldo,
-          data_extrato: new Date(),
+          total: oldExcerpt.data.saldo.total,
+          data_extrato: new Date().toISOString(),
+          limite: oldExcerpt.data.saldo.limite,
         },
-        ultimas_transacoes: transactions.rows,
-      }));
+        ultimas_transacoes: oldExcerpt.data.ultimas_transacoes,
+      });
+
+      res.writeHead(200, {...defaultJsonHeaders, 'content-length': Buffer.byteLength(jsonResult)});
+      res.end(jsonResult);
+      return;
+    }
+
+    Promise.allSettled([
+      sql<{ id: number, limite: number, saldo: number }[]>`SELECT id, limite, saldo FROM pessoas WHERE id = ${id};`,
+      sql<Excerpt['ultimas_transacoes']>`SELECT valor, tipo, descricao, realizada_em FROM transacoes WHERE pessoa_id = ${id} ORDER BY realizada_em DESC LIMIT 10;`,
+    ]).then(([person, transactions]) => {
+      if (person.status === 'rejected') {
+        console.error('Error selecting data', person.reason);
+        return unexpectedError(res);
+      }
+
+      if (person.value.length === 0) {
+        return notFoundHandler(res);
+      }
+
+      if (transactions.status === 'rejected') {
+        console.error('Error selecting data of transactions', transactions.reason);
+        return unexpectedError(res);
+      }
+
+      const excerpt = excerptStringify({
+        saldo: {
+          limite: person.value[0].limite,
+          total: person.value[0].saldo,
+          data_extrato: new Date().toISOString(),
+        },
+        ultimas_transacoes: transactions.value,
+      });
+
+      redis.hset(`person:${id}`, 'extract', excerpt);
+
+      res.writeHead(200, {...defaultJsonHeaders, 'content-length': Buffer.byteLength(excerpt)});
+      res.end(excerpt);
     });
   });
 }
@@ -205,6 +229,6 @@ const server = createServer((req, res) => {
 server.keepAliveTimeout = 60 * 1000;
 server.headersTimeout = 60 * 1000;
 server.maxRequestsPerSocket = 0;
-server.listen(3000, 5_000);
+server.listen(3000, 20_000);
 
 console.log('Server running at http://localhost:3000/');
